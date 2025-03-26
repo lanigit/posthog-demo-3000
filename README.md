@@ -95,6 +95,12 @@ To generate valuable insights in your PostHog project, you'll need to add some h
 python scripts/seed_demo_data.py -k <Project API Key> -p https://<eu or us>.i.posthog.com -d 30 -i 100
 ```
 
+When running this in a Github Codespace, you will need to set an absolute path for the csv location in your workspace to replace the relative path for the script to find the csv. On line 33 of `scripts/seed_demo_data.py`, replace the line with:
+
+```python
+with open('/workspaces/posthog-demo-3000/scripts/500_names_and_emails.csv', newline='') as csvfile:
+```
+
 The input parameters are:
 - `-k`: The Project API key for your demo project.
 - `-h`: The PostHog Host.
