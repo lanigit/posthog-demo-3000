@@ -3,7 +3,7 @@ name = "hogflix-demo"
 version = "1.0.0"
 description = "HogFlix Demo 3000 - A PostHog demo application"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = [
     "alembic>=1.13.2",
     "backoff>=2.2.1",
