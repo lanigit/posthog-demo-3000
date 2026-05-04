@@ -37,6 +37,13 @@ from scripts.seed_helpers.identity_issues import (
     unstable_distinct_ids,
     flag_flip_pattern,
 )
+from scripts.seed_helpers.data_quality import (
+    apply_event_typo,
+    apply_property_typo,
+    maybe_jsonify_property,
+    date_format_drift,
+    plan_name_drift,
+)
 
 # The PostHog Python SDK injects host-machine $os/$os_version into every event,
 # overriding caller-supplied values. Strip those keys from the SDK's system
@@ -224,24 +231,24 @@ def capture_pageview(url, timestamp, client_properties, distinct_id, groups = {}
    
 # Convert and capture Amplitude data
 def capture_event(event, extra_properties, timestamp, distinct_id, groups = {}):
+  uid = _hash_seed(distinct_id)
+  # C4 data quality: event-name typo for ~1.5% of mapped events.
+  event = apply_event_typo(event, uid)
 
-  payload = {
-    "event": event,
-    "distinct_id": distinct_id,
-    "properties": {
-      "timestamp": timestamp,
-      **extra_properties
-    },
+  merged_props = {
     "timestamp": timestamp,
-    "groups": groups
+    **extra_properties,
   }
 
+  # C5 data quality: occasionally rename user_id -> userId/userID/userid.
+  merged_props = apply_property_typo(merged_props, uid)
+
   posthog.capture(
-    event=payload["event"],
-    distinct_id=payload["distinct_id"],
-    properties=payload["properties"],
-    timestamp=payload["timestamp"],
-    groups=payload["groups"]
+    event=event,
+    distinct_id=distinct_id,
+    properties=merged_props,
+    timestamp=timestamp,
+    groups=groups,
   )
 
 def get_client_properties(user = None):
@@ -254,6 +261,8 @@ def get_client_properties(user = None):
          "$session_id": session_id,
          "$active_feature_flags": ["action_mode_on"],
          "$feature/action_mode_on": True if user['is_adult'] == 'Yes' else False,
+         "user_id": user['email'],  # C5 source for property-name typo
+         "family_id": user['family_id'],
          "$set": {
             "email": user['email'],
             "is_adult": user['is_adult'],
@@ -444,10 +453,16 @@ def browse_plans_and_signup(user=None, day_offset=None):
 
    selected_plans = random.sample(plans,2)
    previous_plan = selected_plans[0]
-   new_plan = selected_plans[1]
+   new_plan_canonical = selected_plans[1]
+   # C3 plan name drift: 5-10% of users see Maximal/Maxi-Mal instead of Max-imal.
+   uid = _user_id_int(distinct_id)
+   new_plan = plan_name_drift(new_plan_canonical, uid)
+   # C6 date format drift: signup_date is sometimes Date, sometimes DateTime.
+   signup_date = date_format_drift(datetime.now() - timedelta(days=random.randint(1, 60)), uid)
    client_properties = { **client_properties,
                         "previous_plan": previous_plan,
                         "new_plan": new_plan,
+                        "signup_date": signup_date,
                         "$set": {
                            "plan": new_plan
                         }}
@@ -473,9 +488,18 @@ def browse_plans_and_signup(user=None, day_offset=None):
       'months': months,
       'price': int(round(price_dollars * 100)),
       'currency': 'USD',
+      # Structured 'address' property — C7 occasionally JSON-stringifies it.
+      'address': {
+         'city': fake.city(),
+         'country': fake.country_code(),
+         'zip': fake.postcode(),
+      },
    }
-   # A5 cost amplifier: double-fire subscription_purchased.
-   double_fire_purchase(posthog, distinct_id, 'subscription_purchased',
+   purchase_props = maybe_jsonify_property(purchase_props, 'address', uid, probability=0.05)
+   # A5 cost amplifier: double-fire subscription_purchased. Apply C4 event-typo
+   # before the double-fire so the typo'd variant also fires twice.
+   subscription_event_name = apply_event_typo('subscription_purchased', uid)
+   double_fire_purchase(posthog, distinct_id, subscription_event_name,
                         purchase_props, timestamp, groups=groups)
 
 total_days = int(args.number_of_days)
