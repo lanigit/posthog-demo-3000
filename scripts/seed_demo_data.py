@@ -18,6 +18,12 @@ from scripts.seed_helpers.growth import (
     events_per_session,
     is_user_active_on_day,
 )
+from scripts.seed_helpers.autocapture import (
+    synthesize_autocapture,
+    synthesize_rageclick,
+    synthesize_dead_click,
+)
+from scripts.seed_helpers.exceptions import synthesize_exception
 
 # The PostHog Python SDK injects host-machine $os/$os_version into every event,
 # overriding caller-supplied values. Strip those keys from the SDK's system
@@ -145,6 +151,45 @@ def _user_id_int(email):
     """Stable positive int per email for behavioral_profile()."""
     return abs(hash(email)) & 0x7FFFFFFF
 
+
+def sprinkle_clicks_on_page(distinct_id, page, base_timestamp, client_properties, groups=None):
+    """Emit a few $autocapture clicks (and rare $rageclick / $dead_click) for the
+    page the user just landed on, with second-level offsets after the pageview."""
+    n_clicks = random.randint(1, 4)
+    for i in range(n_clicks):
+        synthesize_autocapture(
+            posthog,
+            distinct_id=distinct_id,
+            page=page,
+            timestamp=base_timestamp + timedelta(seconds=5 + i * 7),
+            session_props=client_properties,
+            groups=groups or {},
+        )
+    if random.random() < 0.01:
+        synthesize_rageclick(
+            posthog, distinct_id=distinct_id, page=page,
+            timestamp=base_timestamp + timedelta(seconds=20),
+            session_props=client_properties, groups=groups or {},
+        )
+    if random.random() < 0.005:
+        synthesize_dead_click(
+            posthog, distinct_id=distinct_id, page=page,
+            timestamp=base_timestamp + timedelta(seconds=25),
+            session_props=client_properties, groups=groups or {},
+        )
+
+
+def maybe_emit_exception(distinct_id, base_timestamp, client_properties, groups=None, probability=0.03):
+    """~3% of sessions emit an $exception event."""
+    if random.random() < probability:
+        synthesize_exception(
+            posthog,
+            distinct_id=distinct_id,
+            timestamp=base_timestamp + timedelta(seconds=random.randint(10, 60)),
+            session_props=client_properties,
+            groups=groups or {},
+        )
+
 def capture_pageview(url, timestamp, client_properties, distinct_id, groups = {}):
    properties = {
       "$current_url": url,
@@ -222,12 +267,15 @@ def browse_and_watch_movie(number = 1, user=None, day_offset=None):
         timestamp = timestamp + timedelta(minutes=random.randint(1,5))
 
         capture_pageview(url='https://hogflix.net/', client_properties = client_properties,timestamp=timestamp, distinct_id = distinct_id, groups=groups)
+        sprinkle_clicks_on_page(distinct_id, '/', timestamp, client_properties, groups)
 
         movie_id = random.randint(1,3)
 
         timestamp = timestamp + timedelta(minutes=random.randint(1,15))
 
         capture_pageview(url=f'https://hogflix.net/movie/{movie_id}', client_properties = client_properties, timestamp=timestamp, distinct_id = distinct_id, groups=groups)
+        sprinkle_clicks_on_page(distinct_id, f'/movie/{movie_id}', timestamp, client_properties, groups)
+        maybe_emit_exception(distinct_id, timestamp, client_properties, groups)
 
         # Simulate occasional revenue events
         if random.randrange(100) < 25:
@@ -275,17 +323,22 @@ def anon_browse_homepage_and_plans(day_offset=None):
    timestamp = get_random_time(day_offset=day_offset)
 
    capture_pageview(url='https://hogflix.net/', client_properties = client_properties,timestamp=timestamp, distinct_id = distinct_id)
-   
+   sprinkle_clicks_on_page(distinct_id, '/', timestamp, client_properties)
+
    timestamp = timestamp + timedelta(minutes=random.randint(1,10))
-   
+
    capture_pageview(url=f'https://hogflix.net/plans', client_properties = client_properties, timestamp=timestamp, distinct_id = distinct_id)
+   sprinkle_clicks_on_page(distinct_id, '/plans', timestamp, client_properties)
 
    if random.randrange(100) < 40:
+      maybe_emit_exception(distinct_id, timestamp, client_properties)
       return None
 
    timestamp = timestamp + timedelta(minutes=random.randint(1,10))
-   
+
    capture_pageview(url=f'https://hogflix.net/signup', client_properties = client_properties, timestamp=timestamp, distinct_id = distinct_id)
+   sprinkle_clicks_on_page(distinct_id, '/signup', timestamp, client_properties)
+   maybe_emit_exception(distinct_id, timestamp, client_properties)
 
 def browse_plans_and_signup(user=None, day_offset=None):
    fake_user = user or random.choice(fake_users)
@@ -300,17 +353,21 @@ def browse_plans_and_signup(user=None, day_offset=None):
    groups = {'family': fake_user['family_id']}
 
    capture_pageview(url='https://hogflix.net/', client_properties = client_properties,timestamp=timestamp, distinct_id = distinct_id, groups=groups)
-   
-   timestamp = timestamp + timedelta(minutes=random.randint(1,10))
-   
-   capture_pageview(url=f'https://hogflix.net/plans', client_properties = client_properties, timestamp=timestamp, distinct_id = distinct_id, groups=groups)
+   sprinkle_clicks_on_page(distinct_id, '/', timestamp, client_properties, groups)
 
    timestamp = timestamp + timedelta(minutes=random.randint(1,10))
-   
-   capture_pageview(url=f'https://hogflix.net/signup', client_properties = client_properties, timestamp=timestamp, distinct_id = distinct_id, groups=groups)
-   
+
+   capture_pageview(url=f'https://hogflix.net/plans', client_properties = client_properties, timestamp=timestamp, distinct_id = distinct_id, groups=groups)
+   sprinkle_clicks_on_page(distinct_id, '/plans', timestamp, client_properties, groups)
+
    timestamp = timestamp + timedelta(minutes=random.randint(1,10))
-   
+
+   capture_pageview(url=f'https://hogflix.net/signup', client_properties = client_properties, timestamp=timestamp, distinct_id = distinct_id, groups=groups)
+   sprinkle_clicks_on_page(distinct_id, '/signup', timestamp, client_properties, groups)
+   maybe_emit_exception(distinct_id, timestamp, client_properties, groups)
+
+   timestamp = timestamp + timedelta(minutes=random.randint(1,10))
+
    selected_plans = random.sample(plans,2)
    previous_plan = selected_plans[0]
    new_plan = selected_plans[1]
