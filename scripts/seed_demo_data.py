@@ -12,6 +12,12 @@ from dotenv import load_dotenv
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from scripts.seed_helpers.browser_context import make_session_properties
+from scripts.seed_helpers.growth import (
+    daily_user_count,
+    behavioral_profile,
+    events_per_session,
+    is_user_active_on_day,
+)
 
 # The PostHog Python SDK injects host-machine $os/$os_version into every event,
 # overriding caller-supplied values. Strip those keys from the SDK's system
@@ -126,12 +132,18 @@ movies_catalog = {
   6: {"title": "The Hedge Abides"}
 }
 
-def get_random_time():
-    random_seconds = random.randint(0,int(args.number_of_days) * 86400)
+def get_random_time(day_offset=None):
+    """Random timestamp. If day_offset is set, return a time within that day
+    (days_ago=day_offset). Otherwise scatter across the whole window."""
+    if day_offset is not None:
+        return datetime.now() - timedelta(days=day_offset, seconds=random.randint(0, 86400))
+    random_seconds = random.randint(0, int(args.number_of_days) * 86400)
+    return datetime.now() - timedelta(seconds=random_seconds)
 
-    random_timestamp = datetime.now() - timedelta(seconds = random_seconds)
 
-    return(random_timestamp)
+def _user_id_int(email):
+    """Stable positive int per email for behavioral_profile()."""
+    return abs(hash(email)) & 0x7FFFFFFF
 
 def capture_pageview(url, timestamp, client_properties, distinct_id, groups = {}):
    properties = {
@@ -191,8 +203,8 @@ def get_client_properties(user = None):
       }
    return properties
 
-def browse_and_watch_movie(number = 1):
-   fake_user = random.choice(fake_users)
+def browse_and_watch_movie(number = 1, user=None, day_offset=None):
+   fake_user = user or random.choice(fake_users)
    distinct_id = fake_user['email']
 
    posthog.group_identify('family', fake_user['family_id'], {
@@ -202,7 +214,7 @@ def browse_and_watch_movie(number = 1):
    groups = {'family': fake_user['family_id']}
 
    for i in range(random.randint(1, number)):
-        timestamp = get_random_time()
+        timestamp = get_random_time(day_offset=day_offset)
         client_properties = get_client_properties(user=fake_user)
         
         capture_event(event='user_logged_in', extra_properties=client_properties, timestamp=timestamp, distinct_id=distinct_id, groups=groups)
@@ -256,12 +268,11 @@ def browse_and_watch_movie(number = 1):
                groups=groups,
             )
 
-def anon_browse_homepage_and_plans():
+def anon_browse_homepage_and_plans(day_offset=None):
    client_properties = get_client_properties()
    distinct_id = fake.uuid4()
-   print(distinct_id)
 
-   timestamp = get_random_time()
+   timestamp = get_random_time(day_offset=day_offset)
 
    capture_pageview(url='https://hogflix.net/', client_properties = client_properties,timestamp=timestamp, distinct_id = distinct_id)
    
@@ -276,12 +287,11 @@ def anon_browse_homepage_and_plans():
    
    capture_pageview(url=f'https://hogflix.net/signup', client_properties = client_properties, timestamp=timestamp, distinct_id = distinct_id)
 
-def browse_plans_and_signup():
-   fake_user = random.choice(fake_users)
+def browse_plans_and_signup(user=None, day_offset=None):
+   fake_user = user or random.choice(fake_users)
    client_properties = get_client_properties(user=fake_user)
    distinct_id = fake_user['email']
-   timestamp = get_random_time()
-   print(distinct_id)
+   timestamp = get_random_time(day_offset=day_offset)
 
    posthog.group_identify('family', fake_user['family_id'], {
       'name': fake_user['last_name']
@@ -310,7 +320,6 @@ def browse_plans_and_signup():
                         "$set": {
                            "plan": new_plan
                         }}
-   print(client_properties)
    capture_event(event='plan_changed', extra_properties=client_properties, timestamp=timestamp, distinct_id=distinct_id, groups=groups)
 
    # Emit subscription intent and purchase for Revenue Analytics
@@ -334,9 +343,55 @@ def browse_plans_and_signup():
       'currency': 'USD',
    }, timestamp=timestamp, distinct_id=distinct_id, groups=groups)
 
-for i in range(int(args.number_of_iterations)):
-   print(args)
-   browse_and_watch_movie(number = 10)
-   anon_browse_homepage_and_plans()
-   browse_plans_and_signup()
-   posthog.flush()
+total_days = int(args.number_of_days)
+
+# Pre-assign a deterministic signup_days_ago per fake_user. Distribute across
+# the window so the growth curve has natural fuel: only old signups can be
+# active on early days; recent signups appear later.
+user_signups = {
+    u['email']: random.Random(u['email']).randint(0, max(1, total_days - 1))
+    for u in fake_users
+}
+
+# Track which users have already had a signup flow emitted (browse_plans_and_signup)
+signed_up_users = set()
+
+print(f"Generating events for {total_days} days, {len(fake_users)} potential users.")
+
+for days_ago in range(total_days, -1, -1):
+    target = daily_user_count(days_ago, total_days)
+    eligible = [
+        u for u in fake_users
+        if is_user_active_on_day(_user_id_int(u['email']), days_ago, user_signups[u['email']])
+    ]
+    if len(eligible) > target:
+        eligible = random.Random(days_ago).sample(eligible, target)
+
+    for user in eligible:
+        profile = behavioral_profile(_user_id_int(user['email']))
+
+        # First active day for this user => emit the signup flow once.
+        if user['email'] not in signed_up_users and user_signups[user['email']] == days_ago:
+            browse_plans_and_signup(user=user, day_offset=days_ago)
+            signed_up_users.add(user['email'])
+            continue
+
+        # Otherwise pick a flow shape based on profile.
+        if profile == 'power':
+            browse_and_watch_movie(number=4, user=user, day_offset=days_ago)
+        elif profile == 'casual':
+            browse_and_watch_movie(number=2, user=user, day_offset=days_ago)
+        elif profile == 'churned':
+            browse_and_watch_movie(number=1, user=user, day_offset=days_ago)
+        elif profile == 'bouncer':
+            # Bouncers also browse anonymously sometimes
+            if random.random() < 0.5:
+                anon_browse_homepage_and_plans(day_offset=days_ago)
+            else:
+                browse_and_watch_movie(number=1, user=user, day_offset=days_ago)
+
+    # A handful of pure-anonymous browse sessions per day (top-of-funnel noise).
+    for _ in range(max(1, target // 10)):
+        anon_browse_homepage_and_plans(day_offset=days_ago)
+
+    posthog.flush()
