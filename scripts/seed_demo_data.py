@@ -4,10 +4,32 @@ from faker import Faker
 from argparse import ArgumentParser
 import random
 import csv
+import sys
 from argparse import ArgumentParser
 from pathlib import Path
 import os
 from dotenv import load_dotenv
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from scripts.seed_helpers.browser_context import make_session_properties
+
+# The PostHog Python SDK injects host-machine $os/$os_version into every event,
+# overriding caller-supplied values. Strip those keys from the SDK's system
+# context so the per-session device profile wins. ($python_runtime/$python_version
+# stay; they're harmless metadata.)
+import posthog.client as _ph_client
+_original_system_context = _ph_client.system_context
+def _system_context_without_os():
+    ctx = dict(_original_system_context())
+    ctx.pop("$os", None)
+    ctx.pop("$os_version", None)
+    return ctx
+_ph_client.system_context = _system_context_without_os
+
+
+def _hash_seed(value):
+    """Stable positive 31-bit int seed from any value."""
+    return abs(hash(str(value))) & 0x7FFFFFFF
 
 days_to_generate = 30
 number_of_iterations = 100
@@ -144,11 +166,13 @@ def capture_event(event, extra_properties, timestamp, distinct_id, groups = {}):
   )
 
 def get_client_properties(user = None):
+   session_id = fake.uuid4()
+   session_props = make_session_properties(_hash_seed(session_id))
    if (user is not None):
       properties= {
-         **random.choice(device_properties),
+         **session_props,
          "$ip": user['ip'],
-         "$session_id": fake.uuid4(),
+         "$session_id": session_id,
          "$active_feature_flags": ["action_mode_on"],
          "$feature/action_mode_on": True if user['is_adult'] == 'Yes' else False,
          "$set": {
@@ -159,9 +183,9 @@ def get_client_properties(user = None):
       }
    else:
       properties= {
-         **random.choice(device_properties),
+         **session_props,
          "$ip": fake.ipv4_public(),
-         "$session_id": fake.uuid4(),
+         "$session_id": session_id,
          "$active_feature_flags": ["action_mode_on"],
          "$feature/action_mode_on": random.choice([True,False])
       }
@@ -169,18 +193,17 @@ def get_client_properties(user = None):
 
 def browse_and_watch_movie(number = 1):
    fake_user = random.choice(fake_users)
-   client_properties = get_client_properties(user=fake_user)
    distinct_id = fake_user['email']
 
    posthog.group_identify('family', fake_user['family_id'], {
       'name': fake_user['last_name']
    })
-    
+
    groups = {'family': fake_user['family_id']}
 
    for i in range(random.randint(1, number)):
         timestamp = get_random_time()
-        client_properties["$session_id"]=fake.uuid4()
+        client_properties = get_client_properties(user=fake_user)
         
         capture_event(event='user_logged_in', extra_properties=client_properties, timestamp=timestamp, distinct_id=distinct_id, groups=groups)
 
