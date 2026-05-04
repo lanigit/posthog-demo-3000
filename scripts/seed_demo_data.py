@@ -32,6 +32,11 @@ from scripts.seed_helpers.cost_amplifiers import (
     double_fire_purchase,
     anonymous_profile_creation,
 )
+from scripts.seed_helpers.identity_issues import (
+    maybe_identify_user,
+    unstable_distinct_ids,
+    flag_flip_pattern,
+)
 
 # The PostHog Python SDK injects host-machine $os/$os_version into every event,
 # overriding caller-supplied values. Strip those keys from the SDK's system
@@ -265,9 +270,12 @@ def get_client_properties(user = None):
       }
    return properties
 
+_identified_users = set()
+
+
 def browse_and_watch_movie(number = 1, user=None, day_offset=None):
    fake_user = user or random.choice(fake_users)
-   distinct_id = fake_user['email']
+   base_distinct_id = fake_user['email']
    family_id = fake_user['family_id']
    family_name = fake_user['last_name']
 
@@ -275,9 +283,25 @@ def browse_and_watch_movie(number = 1, user=None, day_offset=None):
 
    groups = {'family': family_id}
 
+   # B3 identity instability: ~5% of users have 2-3 distinct_ids; per session we
+   # pick one of them. Across multiple sessions the same user lands on different
+   # IDs, so PostHog sees them as separate persons (no alias, no merge).
+   distinct_id_pool = unstable_distinct_ids(fake_user, base_distinct_id)
+   distinct_id = random.choice(distinct_id_pool)
+
    for i in range(random.randint(1, number)):
         timestamp = get_random_time(day_offset=day_offset)
         client_properties = get_client_properties(user=fake_user)
+
+        # B1 partial identification: ~10% of users ever get identified.
+        if base_distinct_id not in _identified_users:
+            if maybe_identify_user(posthog, fake_user, distinct_id, timestamp,
+                                   client_properties, probability=0.10, groups=groups):
+                _identified_users.add(base_distinct_id)
+
+        # B4 flag flip: ~5% of users emit a 3-event flip-flop pattern at session start.
+        flag_flip_pattern(posthog, fake_user, distinct_id, timestamp,
+                          client_properties, groups=groups)
 
         # A4 cost amplifier: $feature_flag_called flood once per session for
         # ~30% of sessions (action_mode_on flag re-evaluated 4x in a tight loop).
