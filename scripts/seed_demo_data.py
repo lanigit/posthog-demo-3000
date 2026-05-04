@@ -24,6 +24,14 @@ from scripts.seed_helpers.autocapture import (
     synthesize_dead_click,
 )
 from scripts.seed_helpers.exceptions import synthesize_exception
+from scripts.seed_helpers.cost_amplifiers import (
+    spam_pageleave,
+    spam_groupidentify,
+    flag_eval_flood,
+    identify_spam,
+    double_fire_purchase,
+    anonymous_profile_creation,
+)
 
 # The PostHog Python SDK injects host-machine $os/$os_version into every event,
 # overriding caller-supplied values. Strip those keys from the SDK's system
@@ -152,9 +160,10 @@ def _user_id_int(email):
     return abs(hash(email)) & 0x7FFFFFFF
 
 
-def sprinkle_clicks_on_page(distinct_id, page, base_timestamp, client_properties, groups=None):
+def sprinkle_clicks_on_page(distinct_id, page, base_timestamp, client_properties, groups=None, family_id=None, family_name=None):
     """Emit a few $autocapture clicks (and rare $rageclick / $dead_click) for the
-    page the user just landed on, with second-level offsets after the pageview."""
+    page the user just landed on, plus the cost-amplifier patterns: $pageleave
+    spam (3x), $groupidentify spam (re-fires each pageview)."""
     n_clicks = random.randint(1, 4)
     for i in range(n_clicks):
         synthesize_autocapture(
@@ -177,6 +186,14 @@ def sprinkle_clicks_on_page(distinct_id, page, base_timestamp, client_properties
             timestamp=base_timestamp + timedelta(seconds=25),
             session_props=client_properties, groups=groups or {},
         )
+    # A6/A2 cost amplifiers: $pageleave fires 3x per pageview; $groupidentify
+    # re-fires after every pageview when the user is in a family group.
+    spam_pageleave(posthog, distinct_id, page, base_timestamp + timedelta(seconds=2),
+                   client_properties, count=3, groups=groups or {})
+    if family_id is not None:
+        spam_groupidentify(posthog, distinct_id, 'family', family_id,
+                           {'name': family_name or ''},
+                           base_timestamp + timedelta(seconds=1))
 
 
 def maybe_emit_exception(distinct_id, base_timestamp, client_properties, groups=None, probability=0.03):
@@ -251,30 +268,50 @@ def get_client_properties(user = None):
 def browse_and_watch_movie(number = 1, user=None, day_offset=None):
    fake_user = user or random.choice(fake_users)
    distinct_id = fake_user['email']
+   family_id = fake_user['family_id']
+   family_name = fake_user['last_name']
 
-   posthog.group_identify('family', fake_user['family_id'], {
-      'name': fake_user['last_name']
-   })
+   posthog.group_identify('family', family_id, {'name': family_name})
 
-   groups = {'family': fake_user['family_id']}
+   groups = {'family': family_id}
 
    for i in range(random.randint(1, number)):
         timestamp = get_random_time(day_offset=day_offset)
         client_properties = get_client_properties(user=fake_user)
-        
+
+        # A4 cost amplifier: $feature_flag_called flood once per session for
+        # ~30% of sessions (action_mode_on flag re-evaluated 4x in a tight loop).
+        if random.random() < 0.3:
+            flag_eval_flood(posthog, distinct_id, ['action_mode_on'],
+                            timestamp + timedelta(seconds=1),
+                            client_properties, flood_count=4, groups=groups)
+
+        # B2 identify spam: ~10% of sessions emit identify() five times.
+        if random.random() < 0.10:
+            identify_spam(posthog, distinct_id,
+                          timestamp,
+                          properties_to_set={
+                              'email': fake_user['email'],
+                              'plan': fake_user['plan'],
+                              'is_adult': fake_user['is_adult'],
+                          },
+                          count=5)
+
         capture_event(event='user_logged_in', extra_properties=client_properties, timestamp=timestamp, distinct_id=distinct_id, groups=groups)
 
         timestamp = timestamp + timedelta(minutes=random.randint(1,5))
 
         capture_pageview(url='https://hogflix.net/', client_properties = client_properties,timestamp=timestamp, distinct_id = distinct_id, groups=groups)
-        sprinkle_clicks_on_page(distinct_id, '/', timestamp, client_properties, groups)
+        sprinkle_clicks_on_page(distinct_id, '/', timestamp, client_properties, groups,
+                                family_id=family_id, family_name=family_name)
 
         movie_id = random.randint(1,3)
 
         timestamp = timestamp + timedelta(minutes=random.randint(1,15))
 
         capture_pageview(url=f'https://hogflix.net/movie/{movie_id}', client_properties = client_properties, timestamp=timestamp, distinct_id = distinct_id, groups=groups)
-        sprinkle_clicks_on_page(distinct_id, f'/movie/{movie_id}', timestamp, client_properties, groups)
+        sprinkle_clicks_on_page(distinct_id, f'/movie/{movie_id}', timestamp, client_properties, groups,
+                                family_id=family_id, family_name=family_name)
         maybe_emit_exception(distinct_id, timestamp, client_properties, groups)
 
         # Simulate occasional revenue events
@@ -322,6 +359,10 @@ def anon_browse_homepage_and_plans(day_offset=None):
 
    timestamp = get_random_time(day_offset=day_offset)
 
+   # A6 cost amplifier: anonymous browse session creates a billed person profile
+   # (mimics the customer running with person_profiles='always').
+   anonymous_profile_creation(posthog, distinct_id, timestamp, client_properties)
+
    capture_pageview(url='https://hogflix.net/', client_properties = client_properties,timestamp=timestamp, distinct_id = distinct_id)
    sprinkle_clicks_on_page(distinct_id, '/', timestamp, client_properties)
 
@@ -344,26 +385,35 @@ def browse_plans_and_signup(user=None, day_offset=None):
    fake_user = user or random.choice(fake_users)
    client_properties = get_client_properties(user=fake_user)
    distinct_id = fake_user['email']
+   family_id = fake_user['family_id']
+   family_name = fake_user['last_name']
    timestamp = get_random_time(day_offset=day_offset)
 
-   posthog.group_identify('family', fake_user['family_id'], {
-      'name': fake_user['last_name']
-   })
-    
-   groups = {'family': fake_user['family_id']}
+   posthog.group_identify('family', family_id, {'name': family_name})
+
+   groups = {'family': family_id}
+
+   # A4 cost amplifier: flag eval flood at session start.
+   if random.random() < 0.3:
+       flag_eval_flood(posthog, distinct_id, ['action_mode_on'],
+                       timestamp + timedelta(seconds=1),
+                       client_properties, flood_count=4, groups=groups)
 
    capture_pageview(url='https://hogflix.net/', client_properties = client_properties,timestamp=timestamp, distinct_id = distinct_id, groups=groups)
-   sprinkle_clicks_on_page(distinct_id, '/', timestamp, client_properties, groups)
+   sprinkle_clicks_on_page(distinct_id, '/', timestamp, client_properties, groups,
+                           family_id=family_id, family_name=family_name)
 
    timestamp = timestamp + timedelta(minutes=random.randint(1,10))
 
    capture_pageview(url=f'https://hogflix.net/plans', client_properties = client_properties, timestamp=timestamp, distinct_id = distinct_id, groups=groups)
-   sprinkle_clicks_on_page(distinct_id, '/plans', timestamp, client_properties, groups)
+   sprinkle_clicks_on_page(distinct_id, '/plans', timestamp, client_properties, groups,
+                           family_id=family_id, family_name=family_name)
 
    timestamp = timestamp + timedelta(minutes=random.randint(1,10))
 
    capture_pageview(url=f'https://hogflix.net/signup', client_properties = client_properties, timestamp=timestamp, distinct_id = distinct_id, groups=groups)
-   sprinkle_clicks_on_page(distinct_id, '/signup', timestamp, client_properties, groups)
+   sprinkle_clicks_on_page(distinct_id, '/signup', timestamp, client_properties, groups,
+                           family_id=family_id, family_name=family_name)
    maybe_emit_exception(distinct_id, timestamp, client_properties, groups)
 
    timestamp = timestamp + timedelta(minutes=random.randint(1,10))
@@ -392,13 +442,17 @@ def browse_plans_and_signup(user=None, day_offset=None):
    }, timestamp=timestamp, distinct_id=distinct_id, groups=groups)
 
    timestamp = timestamp + timedelta(minutes=1)
-   capture_event(event='subscription_purchased', extra_properties={
+   purchase_props = {
+      "timestamp": timestamp,
       **client_properties,
       'plan': new_plan,
       'months': months,
       'price': int(round(price_dollars * 100)),
       'currency': 'USD',
-   }, timestamp=timestamp, distinct_id=distinct_id, groups=groups)
+   }
+   # A5 cost amplifier: double-fire subscription_purchased.
+   double_fire_purchase(posthog, distinct_id, 'subscription_purchased',
+                        purchase_props, timestamp, groups=groups)
 
 total_days = int(args.number_of_days)
 
